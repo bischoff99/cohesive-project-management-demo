@@ -1,0 +1,241 @@
+name: Linear Integration Sync
+
+# Trigger on issue and PR events
+on:
+  issues:
+    types: [opened, edited, closed, reopened]
+  pull_request:
+    types: [opened, edited, closed, reopened, ready_for_review]
+  push:
+    branches: [main, develop]
+
+jobs:
+  sync-with-linear:
+    runs-on: ubuntu-latest
+    name: Sync GitHub events with Linear
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: |
+        npm install @linear/sdk @octokit/rest
+    
+    - name: Sync Issue Creation
+      if: github.event_name == 'issues' && github.event.action == 'opened'
+      env:
+        LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        node -e "
+        const { LinearClient } = require('@linear/sdk');
+        const { Octokit } = require('@octokit/rest');
+        
+        const linear = new LinearClient({ apiKey: process.env.LINEAR_API_KEY });
+        const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+        
+        async function syncIssue() {
+          try {
+            const issue = ${{ toJSON(github.event.issue) }};
+            const teams = await linear.teams();
+            const team = teams.nodes[0]; // Use first team
+            
+            const linearIssue = await linear.issueCreate({
+              teamId: team.id,
+              title: issue.title,
+              description: \`GitHub Issue: \${issue.html_url}\\n\\n\${issue.body || ''\}\`,
+              priority: 2, // Medium priority
+            });
+            
+            // Add comment to GitHub issue with Linear link
+            if (linearIssue.success) {
+              await octokit.rest.issues.createComment({
+                owner: '${{ github.repository_owner }}',
+                repo: '${{ github.event.repository.name }}',
+                issue_number: issue.number,
+                body: \`🔗 **Linear Issue Created**: [\${linearIssue.issue.identifier}](https://linear.app/bischoff66/issue/\${linearIssue.issue.identifier})\`
+              });
+            }
+            
+            console.log('Issue synced successfully');
+          } catch (error) {
+            console.error('Sync failed:', error);
+          }
+        }
+        
+        syncIssue();
+        "
+    
+    - name: Update Linear on PR Status
+      if: github.event_name == 'pull_request'
+      env:
+        LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        node -e "
+        const { LinearClient } = require('@linear/sdk');
+        
+        const linear = new LinearClient({ apiKey: process.env.LINEAR_API_KEY });
+        
+        async function updateLinearFromPR() {
+          try {
+            const pr = ${{ toJSON(github.event.pull_request) }};
+            const branchName = pr.head.ref;
+            
+            // Extract Linear issue ID from branch name (format: feature/BIS-123-description)
+            const issueIdMatch = branchName.match(/BIS-(\\d+)/);
+            if (!issueIdMatch) {
+              console.log('No Linear issue ID found in branch name');
+              return;
+            }
+            
+            const issueIdentifier = \`BIS-\${issueIdMatch[1]}\`;
+            console.log(\`Looking for Linear issue: \${issueIdentifier}\`);
+            
+            // Find the Linear issue
+            const issues = await linear.issues({
+              filter: { identifier: { eq: issueIdentifier } }
+            });
+            
+            if (issues.nodes.length === 0) {
+              console.log('Linear issue not found');
+              return;
+            }
+            
+            const issue = issues.nodes[0];
+            let newStateId = null;
+            
+            // Map PR status to Linear states
+            switch ('${{ github.event.action }}') {
+              case 'opened':
+              case 'ready_for_review':
+                // Set to 'In Review' state
+                const reviewStates = await linear.workflowStates({
+                  filter: { name: { eq: 'In Review' } }
+                });
+                if (reviewStates.nodes.length > 0) {
+                  newStateId = reviewStates.nodes[0].id;
+                }
+                break;
+              case 'closed':
+                if (pr.merged) {
+                  // Set to 'Done' state
+                  const doneStates = await linear.workflowStates({
+                    filter: { name: { eq: 'Done' } }
+                  });
+                  if (doneStates.nodes.length > 0) {
+                    newStateId = doneStates.nodes[0].id;
+                  }
+                }
+                break;
+            }
+            
+            if (newStateId) {
+              await linear.issueUpdate(issue.id, {
+                stateId: newStateId
+              });
+              console.log(\`Updated Linear issue \${issueIdentifier} status\`);
+            }
+            
+          } catch (error) {
+            console.error('PR sync failed:', error);
+          }
+        }
+        
+        updateLinearFromPR();
+        "
+    
+    - name: Notify on Integration Success
+      if: success()
+      run: |
+        echo "🎉 Linear integration sync completed successfully!"
+        echo "Event: ${{ github.event_name }}"
+        echo "Action: ${{ github.event.action }}"
+        echo "Repository: ${{ github.repository }}"
+    
+    - name: Notify on Integration Failure
+      if: failure()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "⚠️ Linear integration sync failed!"
+        # Optionally create an issue for failed sync
+        gh issue create --title "Linear Sync Failed" \
+          --body "Integration sync failed for event: ${{ github.event_name }} action: ${{ github.event.action }}" \
+          --label "bug,integration" || echo "Could not create issue"
+
+  health-check:
+    runs-on: ubuntu-latest
+    name: Integration Health Check
+    # Run daily at 9 AM UTC
+    schedule:
+      - cron: '0 9 * * *'
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+    
+    - name: Test API Connectivity
+      env:
+        LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        node -e "
+        const { LinearClient } = require('@linear/sdk');
+        const { Octokit } = require('@octokit/rest');
+        
+        async function healthCheck() {
+          const results = { github: false, linear: false };
+          
+          try {
+            // Test GitHub API
+            const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+            await octokit.rest.users.getAuthenticated();
+            results.github = true;
+            console.log('✅ GitHub API: Connected');
+          } catch (error) {
+            console.log('❌ GitHub API: Failed -', error.message);
+          }
+          
+          try {
+            // Test Linear API
+            const linear = new LinearClient({ apiKey: process.env.LINEAR_API_KEY });
+            await linear.viewer;
+            results.linear = true;
+            console.log('✅ Linear API: Connected');
+          } catch (error) {
+            console.log('❌ Linear API: Failed -', error.message);
+          }
+          
+          // Summary
+          const allHealthy = Object.values(results).every(Boolean);
+          console.log(\`\\n🏥 Health Check Summary: \${allHealthy ? 'HEALTHY' : 'ISSUES DETECTED'}\`);
+          
+          if (!allHealthy) {
+            process.exit(1);
+          }
+        }
+        
+        healthCheck();
+        "
+    
+    - name: Create Health Check Issue on Failure
+      if: failure()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh issue create --title "Integration Health Check Failed" \
+          --body "Daily health check detected API connectivity issues. Please review integration settings and API tokens." \
+          --label "bug,monitoring,urgent" || echo "Could not create health check issue"
